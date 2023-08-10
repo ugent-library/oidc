@@ -23,15 +23,15 @@ type Config struct {
 	AdditionalScopes []string
 	CookieName       string
 	CookieSecret     []byte
-	CookieSecure     bool
+	CookieInsecure   bool
 }
 
 type Auth struct {
-	oauthConfig   *oauth2.Config
-	tokenVerifier *oidc.IDTokenVerifier
-	secureCookie  *securecookie.SecureCookie
-	cookieName    string
-	cookieSecure  bool
+	oauthConfig    *oauth2.Config
+	tokenVerifier  *oidc.IDTokenVerifier
+	secureCookie   *securecookie.SecureCookie
+	cookieName     string
+	cookieInsecure bool
 }
 
 func NewAuth(ctx context.Context, c Config) (*Auth, error) {
@@ -58,11 +58,11 @@ func NewAuth(ctx context.Context, c Config) (*Auth, error) {
 	tokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: c.ClientID})
 
 	auth := &Auth{
-		oauthConfig:   oauthConfig,
-		tokenVerifier: tokenVerifier,
-		secureCookie:  securecookie.New(c.CookieSecret, nil),
-		cookieName:    c.CookieName,
-		cookieSecure:  c.CookieSecure,
+		oauthConfig:    oauthConfig,
+		tokenVerifier:  tokenVerifier,
+		secureCookie:   securecookie.New(c.CookieSecret, nil),
+		cookieName:     c.CookieName,
+		cookieInsecure: c.CookieInsecure,
 	}
 
 	if auth.cookieName == "" {
@@ -87,7 +87,7 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
 		Name:     a.cookieName,
 		Value:    h,
 		Path:     "/",
-		Secure:   a.cookieSecure,
+		Secure:   !a.cookieInsecure,
 		HttpOnly: true,
 	})
 
