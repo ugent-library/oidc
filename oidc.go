@@ -88,7 +88,7 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
 		HttpOnly: true,
 	})
 
-	http.Redirect(w, r, a.oauthConfig.AuthCodeURL(state), http.StatusTemporaryRedirect)
+	http.Redirect(w, r, a.oauthConfig.AuthCodeURL(state), http.StatusFound)
 
 	return nil
 }
