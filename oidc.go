@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
-	"github.com/gorilla/securecookie"
 	"golang.org/x/oauth2"
 )
 
@@ -21,20 +21,21 @@ type Config struct {
 	ClientSecret     string
 	RedirectURL      string
 	AdditionalScopes []string
-	CookieName       string
-	CookieSecret     []byte
-	Insecure         bool
+	CookiePrefix     string
 }
 
 type Auth struct {
-	oauthConfig   *oauth2.Config
-	tokenVerifier *oidc.IDTokenVerifier
-	secureCookie  *securecookie.SecureCookie
-	cookieName    string
-	insecure      bool
+	oauthConfig     *oauth2.Config
+	tokenVerifier   *oidc.IDTokenVerifier
+	stateCookieName string
+	nonceCookieName string
 }
 
 func NewAuth(ctx context.Context, c Config) (*Auth, error) {
+	if c.CookiePrefix == "" {
+		c.CookiePrefix = "oidc."
+	}
+
 	oidcProvider, err := oidc.NewProvider(ctx, c.URL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: %w", err)
@@ -58,65 +59,80 @@ func NewAuth(ctx context.Context, c Config) (*Auth, error) {
 	tokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: c.ClientID})
 
 	auth := &Auth{
-		oauthConfig:   oauthConfig,
-		tokenVerifier: tokenVerifier,
-		secureCookie:  securecookie.New(c.CookieSecret, nil),
-		cookieName:    c.CookieName,
-		insecure:      c.Insecure,
-	}
-
-	if auth.cookieName == "" {
-		auth.cookieName = "oidc.state"
+		oauthConfig:     oauthConfig,
+		tokenVerifier:   tokenVerifier,
+		stateCookieName: c.CookiePrefix + "state",
+		nonceCookieName: c.CookiePrefix + "nonce",
 	}
 
 	return auth, nil
 }
 
 func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
-	state, err := newState()
+	state, err := newRand()
 	if err != nil {
 		return fmt.Errorf("oidc: %w", err)
 	}
 
-	h, err := a.secureCookie.Encode(a.cookieName, state)
+	nonce, err := newRand()
 	if err != nil {
 		return fmt.Errorf("oidc: %w", err)
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     a.cookieName,
-		Value:    h,
+		Name:     a.stateCookieName,
+		Value:    state,
 		Path:     "/",
-		Secure:   !a.insecure,
+		Secure:   r.TLS != nil,
 		HttpOnly: true,
+		MaxAge:   int(5 * time.Minute),
 	})
 
-	http.Redirect(w, r, a.oauthConfig.AuthCodeURL(state), http.StatusFound)
+	http.SetCookie(w, &http.Cookie{
+		Name:     a.nonceCookieName,
+		Value:    nonce,
+		Path:     "/",
+		Secure:   r.TLS != nil,
+		HttpOnly: true,
+		MaxAge:   int(5 * time.Minute),
+	})
+
+	authURL := a.oauthConfig.AuthCodeURL(state, oidc.Nonce(nonce))
+
+	http.Redirect(w, r, authURL, http.StatusFound)
 
 	return nil
 }
 
 func (a *Auth) CompleteAuth(w http.ResponseWriter, r *http.Request, claims any) error {
-	cookie, err := r.Cookie(a.cookieName)
+	stateCookie, err := r.Cookie(a.stateCookieName)
 	if err != nil {
 		return fmt.Errorf("oidc: %w", err)
 	}
 
-	var state string
-	if err = a.secureCookie.Decode(a.cookieName, cookie.Value, &state); err != nil {
+	nonceCookie, err := r.Cookie(a.nonceCookieName)
+	if err != nil {
 		return fmt.Errorf("oidc: %w", err)
 	}
 
-	// delete cookie
+	// delete cookies
 	http.SetCookie(w, &http.Cookie{
-		Name:     a.cookieName,
+		Name:     a.stateCookieName,
 		Path:     "/",
-		Secure:   !a.insecure,
+		Secure:   r.TLS != nil,
+		HttpOnly: true,
+		MaxAge:   -1,
+	})
+	http.SetCookie(w, &http.Cookie{
+		Name:     a.nonceCookieName,
+		Path:     "/",
+		Secure:   r.TLS != nil,
 		HttpOnly: true,
 		MaxAge:   -1,
 	})
 
-	if r.URL.Query().Get("state") != state {
+	// check state param
+	if r.URL.Query().Get("state") != stateCookie.Value {
 		return errors.New("oidc: invalid state parameter")
 	}
 
@@ -137,16 +153,19 @@ func (a *Auth) CompleteAuth(w http.ResponseWriter, r *http.Request, claims any) 
 		return fmt.Errorf("oidc: %w", err)
 	}
 
+	// check nonce
+	if idToken.Nonce != nonceCookie.Value {
+		return errors.New("oidc: invalid nonce")
+	}
+
 	return idToken.Claims(claims)
 }
 
-func newState() (string, error) {
+func newRand() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 
-	state := base64.StdEncoding.EncodeToString(b)
-
-	return state, nil
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
