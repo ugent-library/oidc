@@ -85,7 +85,7 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
 		Path:     "/",
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
-		MaxAge:   int(5 * time.Minute),
+		MaxAge:   int(time.Hour.Seconds()),
 	})
 
 	http.SetCookie(w, &http.Cookie{
@@ -94,7 +94,7 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
 		Path:     "/",
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
-		MaxAge:   int(5 * time.Minute),
+		MaxAge:   int(time.Hour.Seconds()),
 	})
 
 	authURL := a.oauthConfig.AuthCodeURL(state, oidc.Nonce(nonce))
