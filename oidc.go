@@ -115,22 +115,6 @@ func (a *Auth) CompleteAuth(w http.ResponseWriter, r *http.Request, claims any) 
 		return fmt.Errorf("oidc: %w", err)
 	}
 
-	// delete cookies
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.stateCookieName,
-		Path:     "/",
-		Secure:   r.TLS != nil,
-		HttpOnly: true,
-		MaxAge:   -1,
-	})
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.nonceCookieName,
-		Path:     "/",
-		Secure:   r.TLS != nil,
-		HttpOnly: true,
-		MaxAge:   -1,
-	})
-
 	// check state param
 	if r.URL.Query().Get("state") != stateCookie.Value {
 		return errors.New("oidc: invalid state parameter")
