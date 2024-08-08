@@ -1,42 +1,59 @@
 // Package oidc aims to provide an easy-to-use way to do OpenID Connect ID token
 // based authentication in your Go web app.
+
+// TODO support PKCE
 package oidc
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/gorilla/securecookie"
+	"github.com/ugent-library/crypt"
 	"golang.org/x/oauth2"
 )
 
+const (
+	defaultCookiePrefix = "oidc."
+	defaultCookieMaxAge = time.Hour
+)
+
 type Config struct {
-	URL              string
+	IssuerURL        string
 	ClientID         string
 	ClientSecret     string
 	RedirectURL      string
 	AdditionalScopes []string
+	CookieInsecure   bool
+	CookieMaxAge     time.Duration
+	CookieSecret     []byte
+	CookieHashSecret []byte
 	CookiePrefix     string
 }
 
 type Auth struct {
-	oauthConfig     *oauth2.Config
-	tokenVerifier   *oidc.IDTokenVerifier
-	stateCookieName string
-	nonceCookieName string
+	oauthConfig    *oauth2.Config
+	tokenVerifier  *oidc.IDTokenVerifier
+	cookies        *securecookie.SecureCookie
+	cookieInsecure bool
+	cookieMaxAge   time.Duration
+	stateCookie    string
+	nonceCookie    string
 }
 
 func NewAuth(ctx context.Context, c Config) (*Auth, error) {
 	if c.CookiePrefix == "" {
-		c.CookiePrefix = "oidc."
+		c.CookiePrefix = defaultCookiePrefix
+	}
+	if c.CookieMaxAge == 0 {
+		c.CookieMaxAge = defaultCookieMaxAge
 	}
 
-	oidcProvider, err := oidc.NewProvider(ctx, c.URL)
+	oidcProvider, err := oidc.NewProvider(ctx, c.IssuerURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidc: %w", err)
 	}
@@ -52,50 +69,39 @@ func NewAuth(ctx context.Context, c Config) (*Auth, error) {
 
 	if c.AdditionalScopes != nil {
 		oauthConfig.Scopes = append(oauthConfig.Scopes, c.AdditionalScopes...)
-	} else {
-		oauthConfig.Scopes = append(oauthConfig.Scopes, "profile")
 	}
 
 	tokenVerifier := oidcProvider.Verifier(&oidc.Config{ClientID: c.ClientID})
 
 	auth := &Auth{
-		oauthConfig:     oauthConfig,
-		tokenVerifier:   tokenVerifier,
-		stateCookieName: c.CookiePrefix + "state",
-		nonceCookieName: c.CookiePrefix + "nonce",
+		oauthConfig:    oauthConfig,
+		tokenVerifier:  tokenVerifier,
+		cookies:        securecookie.New(c.CookieHashSecret, c.CookieSecret),
+		cookieInsecure: c.CookieInsecure,
+		cookieMaxAge:   c.CookieMaxAge,
+		stateCookie:    c.CookiePrefix + "state",
+		nonceCookie:    c.CookiePrefix + "nonce",
 	}
 
 	return auth, nil
 }
 
 func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
-	state, err := newRand()
+	state, err := crypt.RandomString(32)
+	if err != nil {
+		return fmt.Errorf("oidc: %w", err)
+	}
+	nonce, err := crypt.RandomString(32)
 	if err != nil {
 		return fmt.Errorf("oidc: %w", err)
 	}
 
-	nonce, err := newRand()
-	if err != nil {
-		return fmt.Errorf("oidc: %w", err)
+	if err := a.setAuthCookie(w, a.stateCookie, state); err != nil {
+		return err
 	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.stateCookieName,
-		Value:    state,
-		Path:     "/",
-		Secure:   r.TLS != nil,
-		HttpOnly: true,
-		MaxAge:   int(time.Hour.Seconds()),
-	})
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.nonceCookieName,
-		Value:    nonce,
-		Path:     "/",
-		Secure:   r.TLS != nil,
-		HttpOnly: true,
-		MaxAge:   int(time.Hour.Seconds()),
-	})
+	if err := a.setAuthCookie(w, a.nonceCookie, nonce); err != nil {
+		return err
+	}
 
 	authURL := a.oauthConfig.AuthCodeURL(state, oidc.Nonce(nonce))
 
@@ -105,19 +111,18 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (a *Auth) CompleteAuth(w http.ResponseWriter, r *http.Request, claims any) error {
-	stateCookie, err := r.Cookie(a.stateCookieName)
+	state, err := a.getAuthCookie(r, a.stateCookie)
 	if err != nil {
-		return fmt.Errorf("oidc: %w", err)
+		return err
 	}
-
-	nonceCookie, err := r.Cookie(a.nonceCookieName)
+	nonce, err := a.getAuthCookie(r, a.nonceCookie)
 	if err != nil {
-		return fmt.Errorf("oidc: %w", err)
+		return err
 	}
 
 	// check state param
-	if r.URL.Query().Get("state") != stateCookie.Value {
-		return errors.New("oidc: invalid state parameter")
+	if r.URL.Query().Get("state") != state {
+		return errors.New("oidc: invalid state")
 	}
 
 	oauthToken, err := a.oauthConfig.Exchange(r.Context(), r.URL.Query().Get("code"))
@@ -138,18 +143,40 @@ func (a *Auth) CompleteAuth(w http.ResponseWriter, r *http.Request, claims any) 
 	}
 
 	// check nonce
-	if idToken.Nonce != nonceCookie.Value {
+	if idToken.Nonce != nonce {
 		return errors.New("oidc: invalid nonce")
 	}
 
 	return idToken.Claims(claims)
 }
 
-func newRand() (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+func (a *Auth) setAuthCookie(w http.ResponseWriter, name, val string) error {
+	v, err := a.cookies.Encode(name, val)
+	if err != nil {
+		return fmt.Errorf("oidc: can't encode cookie %s: %w", name, err)
 	}
 
-	return base64.RawURLEncoding.EncodeToString(b), nil
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    v,
+		Path:     "/",
+		Expires:  time.Now().Add(a.cookieMaxAge),
+		HttpOnly: true,
+		Secure:   !a.cookieInsecure,
+		SameSite: http.SameSiteStrictMode,
+	})
+
+	return nil
+}
+
+func (a *Auth) getAuthCookie(r *http.Request, name string) (string, error) {
+	cookie, err := r.Cookie(name)
+	if err != nil {
+		return "", fmt.Errorf("oidc: can't get cookie %s: %w", name, err)
+	}
+	var val string
+	if err := a.cookies.Decode(name, cookie.Value, &val); err != nil {
+		return "", fmt.Errorf("oidc: can't decode cookie %s: %w", name, err)
+	}
+	return val, nil
 }
